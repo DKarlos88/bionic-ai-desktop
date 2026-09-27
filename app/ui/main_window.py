@@ -13,13 +13,16 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QTabWidget,
 )
-from PySide6.QtCore import QThread, QObject, Signal, Slot
+from PySide6.QtCore import QThread, QObject, Signal
 
 from app.config import WINDOW_WIDTH, WINDOW_HEIGHT, APP_NAME
 from app.ollama_client import OllamaClient
+from app.storage.database import Database
+from app.agent.tools_loader import load_tools
+from app.agent.agent_loop import AgentLoop
 from app.ui.chat_widget import ChatWidget
 from app.ui.audit_widget import AuditWidget
-from app.storage.database import Database
+from app.ui.approval_dialog import ApprovalDialog
 
 logger = logging.getLogger(__name__)
 
@@ -30,18 +33,30 @@ class GenerateWorker(QObject):
     finished = Signal(str)
     error = Signal(str)
 
-    def __init__(self, client: OllamaClient, model: str, prompt: str):
+    def __init__(self, agent: AgentLoop, model: str, prompt: str):
         super().__init__()
-        self.client = client
+        self.agent = agent
         self.model = model
         self.prompt = prompt
 
     def run(self):
         try:
-            response = self.client.generate(self.model, self.prompt)
+            response = self.agent.generate_with_tools(
+                self.model,
+                self.prompt,
+                approval_callback=self.approval_callback,
+            )
             self.finished.emit(response)
         except Exception as e:
             self.error.emit(str(e))
+
+    def approval_callback(self, tool_name, description, permission_level, parameters):
+        """Show approval dialog for tool execution"""
+        dialog = ApprovalDialog(
+            tool_name, description, permission_level, parameters
+        )
+        result = dialog.exec_()
+        return (result == 1), dialog.approved_for_session
 
 
 class MainWindow(QMainWindow):
@@ -51,6 +66,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.client = OllamaClient()
         self.db = Database()
+        self.registry = load_tools()
+        self.agent = AgentLoop(self.client, self.registry, self.db)
         self.current_conversation = None
 
         self.setWindowTitle(APP_NAME)
@@ -66,7 +83,6 @@ class MainWindow(QMainWindow):
 
         main_layout = QVBoxLayout(central_widget)
 
-        # Top panel with model selector
         top_layout = QHBoxLayout()
         top_layout.addWidget(QLabel("Modelo:"))
         self.model_combo = QComboBox()
@@ -77,7 +93,6 @@ class MainWindow(QMainWindow):
         top_layout.addStretch()
         main_layout.addLayout(top_layout)
 
-        # Tabs for chat and audit
         self.tabs = QTabWidget()
         self.chat_widget = ChatWidget()
         self.audit_widget = AuditWidget(self.db)
@@ -85,12 +100,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.audit_widget, "Auditoría")
         main_layout.addWidget(self.tabs)
 
-        # Connect signals
         self.chat_widget.send_button.clicked.connect(self.send_message)
         self.chat_widget.input_box.returnPressed.connect(self.send_message)
         self.chat_widget.clear_button.clicked.connect(self.clear_chat)
 
-        # Create new conversation
         self.current_conversation = self.db.create_conversation("Nueva conversación")
 
     def check_ollama_connection(self):
@@ -115,7 +128,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Sin modelos",
-                "No hay modelos disponibles.\n" "Descarga uno usando: ollama pull llama3.1",
+                "No hay modelos disponibles.\nDescarga uno usando: ollama pull llama3.1",
             )
             return
 
@@ -133,13 +146,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "No hay modelos disponibles")
             return
 
-        # Save user message
         self.chat_widget.append_user_message(text)
         self.db.add_message(self.current_conversation, "user", text)
         self.chat_widget.clear_input()
 
-        # Generate response in thread
-        worker = GenerateWorker(self.client, current_model, text)
+        worker = GenerateWorker(self.agent, current_model, text)
         thread = QThread(self)
         worker.moveToThread(thread)
 
@@ -156,6 +167,7 @@ class MainWindow(QMainWindow):
         """Handle AI response"""
         self.chat_widget.append_assistant_message(text)
         self.db.add_message(self.current_conversation, "assistant", text)
+        self.audit_widget.load_logs()
 
     def on_error(self, error: str):
         """Handle error"""
