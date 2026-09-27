@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QTabWidget,
 )
-from PySide6.QtCore import QThread, QObject, Signal
+from PySide6.QtCore import QThread, QObject, Signal, QMetaObject, Qt
 
 from app.config import WINDOW_WIDTH, WINDOW_HEIGHT, APP_NAME
 from app.ollama_client import OllamaClient
@@ -32,31 +32,39 @@ class GenerateWorker(QObject):
 
     finished = Signal(str)
     error = Signal(str)
+    approval_requested = Signal(str, str, str, dict)  # tool_name, description, level, params
 
     def __init__(self, agent: AgentLoop, model: str, prompt: str):
         super().__init__()
         self.agent = agent
         self.model = model
         self.prompt = prompt
+        self.approval_result = None
 
     def run(self):
         try:
             response = self.agent.generate_with_tools(
                 self.model,
                 self.prompt,
-                approval_callback=self.approval_callback,
+                approval_callback=self.request_approval,
             )
             self.finished.emit(response)
         except Exception as e:
+            logger.exception(f"Generation error: {e}")
             self.error.emit(str(e))
 
-    def approval_callback(self, tool_name, description, permission_level, parameters):
-        """Show approval dialog for tool execution"""
-        dialog = ApprovalDialog(
-            tool_name, description, permission_level, parameters
-        )
-        result = dialog.exec_()
-        return (result == 1), dialog.approved_for_session
+    def request_approval(self, tool_name, description, permission_level, parameters):
+        """Request approval - emit signal to main thread"""
+        # Store approval result temporarily
+        self.approval_requested.emit(tool_name, description, permission_level.value, str(parameters))
+        
+        # Wait for result from main thread
+        # This is a simplified approach - the main thread will set this
+        return getattr(self, '_approval_result', (False, False))
+
+    def set_approval_result(self, approved: bool, approved_for_session: bool):
+        """Set the approval result from main thread"""
+        self._approval_result = (approved, approved_for_session)
 
 
 class MainWindow(QMainWindow):
@@ -69,6 +77,7 @@ class MainWindow(QMainWindow):
         self.registry = load_tools()
         self.agent = AgentLoop(self.client, self.registry, self.db)
         self.current_conversation = None
+        self.current_worker = None
 
         self.setWindowTitle(APP_NAME)
         self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -150,18 +159,50 @@ class MainWindow(QMainWindow):
         self.db.add_message(self.current_conversation, "user", text)
         self.chat_widget.clear_input()
 
-        worker = GenerateWorker(self.agent, current_model, text)
+        self.current_worker = GenerateWorker(self.agent, current_model, text)
         thread = QThread(self)
-        worker.moveToThread(thread)
+        self.current_worker.moveToThread(thread)
 
-        worker.finished.connect(self.on_response_received)
-        worker.error.connect(self.on_error)
-        thread.started.connect(worker.run)
-        worker.finished.connect(thread.quit)
-        worker.error.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.error.connect(worker.deleteLater)
+        # Connect signals
+        self.current_worker.finished.connect(self.on_response_received)
+        self.current_worker.error.connect(self.on_error)
+        self.current_worker.approval_requested.connect(self.on_approval_requested)
+        thread.started.connect(self.current_worker.run)
+        self.current_worker.finished.connect(thread.quit)
+        self.current_worker.error.connect(thread.quit)
+        self.current_worker.finished.connect(self.current_worker.deleteLater)
+        self.current_worker.error.connect(self.current_worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        
         thread.start()
+
+    def on_approval_requested(self, tool_name: str, description: str, permission_level: str, parameters: str):
+        """Handle approval request from worker thread"""
+        dialog = ApprovalDialog(
+            tool_name, 
+            description, 
+            self._parse_permission_level(permission_level),
+            self._parse_parameters(parameters)
+        )
+        result = dialog.exec_()
+        approved = result == 1
+        approved_for_session = dialog.approved_for_session if approved else False
+        
+        if self.current_worker:
+            self.current_worker.set_approval_result(approved, approved_for_session)
+
+    def _parse_permission_level(self, level_str: str):
+        """Parse permission level string back to enum"""
+        from app.agent.permission_manager import PermissionLevel
+        return PermissionLevel[level_str.upper()]
+
+    def _parse_parameters(self, params_str: str) -> dict:
+        """Parse parameters string to dict"""
+        import ast
+        try:
+            return ast.literal_eval(params_str)
+        except:
+            return {}
 
     def on_response_received(self, text: str):
         """Handle AI response"""
