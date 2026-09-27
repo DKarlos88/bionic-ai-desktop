@@ -13,13 +13,14 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QTabWidget,
 )
-from PySide6.QtCore import QThread, QObject, Signal, QMetaObject, Qt
+from PySide6.QtCore import QThread, QObject, Signal
 
 from app.config import WINDOW_WIDTH, WINDOW_HEIGHT, APP_NAME
 from app.ollama_client import OllamaClient
 from app.storage.database import Database
 from app.agent.tools_loader import load_tools
 from app.agent.agent_loop import AgentLoop
+from app.agent.permission_manager import PermissionLevel
 from app.ui.chat_widget import ChatWidget
 from app.ui.audit_widget import AuditWidget
 from app.ui.approval_dialog import ApprovalDialog
@@ -27,19 +28,29 @@ from app.ui.approval_dialog import ApprovalDialog
 logger = logging.getLogger(__name__)
 
 
+class ApprovalRequest:
+    """Container for approval request data"""
+    def __init__(self, tool_name: str, description: str, permission_level: PermissionLevel, parameters: dict):
+        self.tool_name = tool_name
+        self.description = description
+        self.permission_level = permission_level
+        self.parameters = parameters
+
+
 class GenerateWorker(QObject):
     """Worker thread for AI generation"""
 
     finished = Signal(str)
     error = Signal(str)
-    approval_requested = Signal(str, str, str, dict)  # tool_name, description, level, params
+    approval_requested = Signal(object)  # ApprovalRequest object
 
     def __init__(self, agent: AgentLoop, model: str, prompt: str):
         super().__init__()
         self.agent = agent
         self.model = model
         self.prompt = prompt
-        self.approval_result = None
+        self._approval_result = (False, False)
+        self._approval_event = None
 
     def run(self):
         try:
@@ -55,16 +66,25 @@ class GenerateWorker(QObject):
 
     def request_approval(self, tool_name, description, permission_level, parameters):
         """Request approval - emit signal to main thread"""
-        # Store approval result temporarily
-        self.approval_requested.emit(tool_name, description, permission_level.value, str(parameters))
+        request = ApprovalRequest(tool_name, description, permission_level, parameters)
+        self.approval_requested.emit(request)
         
-        # Wait for result from main thread
-        # This is a simplified approach - the main thread will set this
-        return getattr(self, '_approval_result', (False, False))
+        # Wait a bit for main thread to process (simplified blocking)
+        import time
+        for _ in range(50):  # Wait up to 5 seconds
+            if self._approval_result != (False, False) or getattr(self, '_approval_set', False):
+                break
+            time.sleep(0.1)
+        
+        result = self._approval_result
+        self._approval_result = (False, False)
+        self._approval_set = False
+        return result
 
     def set_approval_result(self, approved: bool, approved_for_session: bool):
         """Set the approval result from main thread"""
         self._approval_result = (approved, approved_for_session)
+        self._approval_set = True
 
 
 class MainWindow(QMainWindow):
@@ -176,13 +196,13 @@ class MainWindow(QMainWindow):
         
         thread.start()
 
-    def on_approval_requested(self, tool_name: str, description: str, permission_level: str, parameters: str):
+    def on_approval_requested(self, request: ApprovalRequest):
         """Handle approval request from worker thread"""
         dialog = ApprovalDialog(
-            tool_name, 
-            description, 
-            self._parse_permission_level(permission_level),
-            self._parse_parameters(parameters)
+            request.tool_name,
+            request.description,
+            request.permission_level,
+            request.parameters,
         )
         result = dialog.exec_()
         approved = result == 1
@@ -190,19 +210,6 @@ class MainWindow(QMainWindow):
         
         if self.current_worker:
             self.current_worker.set_approval_result(approved, approved_for_session)
-
-    def _parse_permission_level(self, level_str: str):
-        """Parse permission level string back to enum"""
-        from app.agent.permission_manager import PermissionLevel
-        return PermissionLevel[level_str.upper()]
-
-    def _parse_parameters(self, params_str: str) -> dict:
-        """Parse parameters string to dict"""
-        import ast
-        try:
-            return ast.literal_eval(params_str)
-        except:
-            return {}
 
     def on_response_received(self, text: str):
         """Handle AI response"""
