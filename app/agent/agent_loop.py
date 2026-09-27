@@ -1,11 +1,12 @@
 """Agent loop for autonomous AI execution with tool support"""
 
-import logging
 import json
+import logging
 import re
 from typing import Optional
+
+from app.agent.permission_manager import PermissionLevel, PermissionManager
 from app.agent.tool_registry import ToolRegistry
-from app.agent.permission_manager import PermissionManager, PermissionLevel
 from app.ollama_client import OllamaClient
 from app.storage.database import Database
 
@@ -13,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 
 class AgentLoop:
-    """Main agent loop for handling tool requests and user interactions"""
+    """Main agent loop for handling tool requests and user interactions."""
 
     def __init__(
         self,
@@ -26,10 +27,10 @@ class AgentLoop:
         self.registry = registry
         self.db = db
         self.permission_manager = permission_manager or PermissionManager()
-        self.session_approvals = set()  # Tools approved for this session
+        self.session_approvals = set()
 
     def get_tools_description(self) -> str:
-        """Get formatted description of available tools for the AI"""
+        """Get formatted description of available tools for the AI."""
         tools = self.registry.list_tools()
         description = "Available tools:\n\n"
 
@@ -38,57 +39,78 @@ class AgentLoop:
             description += f"- {tool.name}({params_str}): {tool.description}\n"
 
         description += (
-            "\nTo use a tool, include [TOOL] in your response followed by "
-            "the tool name and parameters in JSON format. Example: "
-            '[TOOL]create_folder {"folder_path": "C:\\\\Users\\\\test\\\\MyFolder"}'
+            "\nCRITICAL INSTRUCTIONS:\n"
+            "1. If the user asks for a file or system action, decide if a tool is needed.\n"
+            "2. If a tool is needed, return EXACTLY one tool call in this format:\n"
+            "   [TOOL]create_folder {\"folder_path\": \"C:\\\\Users\\\\test\\\\MyFolder\"}\n"
+            "3. Do not add markdown, explanations, or extra words before or after the tool call.\n"
+            "4. If no tool is needed, reply normally in natural language.\n"
+            "5. Only use one tool at a time."
         )
         return description
 
+    def build_system_prompt(self, user_prompt: str) -> str:
+        """Build a stronger system prompt for tool-driven actions."""
+        return (
+            "You are Bionic AI Desktop, a desktop assistant that uses tools when needed.\n\n"
+            "Use tools only when the user asks for a filesystem, system, or command action.\n"
+            "When a tool is needed, respond with exactly this format and nothing else:\n"
+            "[TOOL]tool_name {\"param_name\": \"value\"}\n\n"
+            "Examples:\n"
+            "[TOOL]create_folder {\"folder_path\": \"C:\\\\Users\\\\test\\\\Proyecto\"}\n"
+            "[TOOL]read_file {\"file_path\": \"C:\\\\Users\\\\test\\\\notes.txt\"}\n"
+            "\n"
+            "Never use markdown, never explain the tool call, and never add extra text around it.\n"
+            "If the user request does not require a tool, answer normally.\n\n"
+            f"User request: {user_prompt}\n\n"
+            f"{self.get_tools_description()}"
+        )
+
     def parse_tool_request(self, response: str) -> Optional[tuple[str, dict]]:
-        """Parse tool request from AI response"""
-        # Look for [TOOL] pattern
-        pattern = r"\[TOOL\]([a-zA-Z_]+)\s*({.*?})"
-        match = re.search(pattern, response, re.DOTALL)
+        """Parse a tool request from an AI response."""
+        text = response.strip()
+
+        # Primary format: [TOOL]name {json}
+        pattern = r"\[TOOL\]\s*([a-zA-Z_]+)\s*(\{.*?\})\s*$"
+        match = re.search(pattern, text, re.DOTALL)
 
         if not match:
-            return None
+            # Fallback: allow extra commentary before/after the tool call
+            fallback = re.search(r"\[TOOL\]\s*([a-zA-Z_]+)\s*(\{.*?\})", text, re.DOTALL)
+            if not fallback:
+                return None
+            match = fallback
 
         tool_name = match.group(1)
         try:
             params = json.loads(match.group(2))
+            if not isinstance(params, dict):
+                return None
             return tool_name, params
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse tool parameters: {e}")
             return None
 
     def process_response(self, response: str) -> Optional[tuple[str, dict]]:
-        """Check if response contains a tool request"""
+        """Check if response contains a tool request."""
         return self.parse_tool_request(response)
 
     def should_request_approval(
         self, tool_name: str, permission_level: PermissionLevel
     ) -> bool:
-        """Check if tool needs approval for this request"""
-        # Always approve if in session approvals
+        """Check if tool needs approval for this request."""
         if tool_name in self.session_approvals:
             return False
-
-        # Always request approval for HIGH risk
         if permission_level == PermissionLevel.HIGH:
             return True
-
-        # Request approval for MEDIUM and LOW (can be approved for session)
         return True
 
-    def execute_tool(
-        self, tool_name: str, parameters: dict
-    ) -> tuple[bool, str]:
-        """Execute a tool with safety checks"""
+    def execute_tool(self, tool_name: str, parameters: dict) -> tuple[bool, str]:
+        """Execute a tool with safety checks."""
         tool = self.registry.get_tool(tool_name)
         if not tool:
             return False, f"Tool not found: {tool_name}"
 
-        # Validate parameters
         try:
             result = tool.func(**parameters)
             self.db.log_action(
@@ -114,18 +136,15 @@ class AgentLoop:
     def generate_with_tools(
         self, model: str, prompt: str, approval_callback=None
     ) -> str:
-        """Generate response with tool support"""
-        # Add tools description to system context
-        system_prompt = f"{prompt}\n\n{self.get_tools_description()}"
+        """Generate response with tool support."""
+        system_prompt = self.build_system_prompt(prompt)
 
-        # Get initial response
         try:
             response = self.client.generate(model, system_prompt)
         except Exception as e:
             logger.error(f"Generation failed: {e}")
             return f"Error: {str(e)}"
 
-        # Check if response contains a tool request
         tool_request = self.process_response(response)
         if not tool_request:
             return response
@@ -135,46 +154,34 @@ class AgentLoop:
         if not tool:
             return f"{response}\n\n(Tool {tool_name} not found)"
 
-        # Check if approval is needed
         if not self.should_request_approval(tool_name, tool.permission_level):
-            # Auto-execute if already approved for session
             success, result = self.execute_tool(tool_name, parameters)
             if success:
-                # Get follow-up response from AI
                 follow_up_prompt = (
                     f"The tool {tool_name} was executed successfully. "
                     f"Result: {result}\n\nPlease provide a helpful response to the user."
                 )
-                follow_up_response = self.client.generate(model, follow_up_prompt)
-                return follow_up_response
-            else:
+                return self.client.generate(model, follow_up_prompt)
+            return result
+
+        if approval_callback:
+            approved, approved_for_session = approval_callback(
+                tool_name, tool.description, tool.permission_level, parameters
+            )
+
+            if approved:
+                if approved_for_session:
+                    self.session_approvals.add(tool_name)
+
+                success, result = self.execute_tool(tool_name, parameters)
+                if success:
+                    follow_up_prompt = (
+                        f"The tool {tool_name} was executed successfully. "
+                        f"Result: {result}\n\nPlease provide a helpful response to the user."
+                    )
+                    return self.client.generate(model, follow_up_prompt)
                 return result
-        else:
-            # Request approval
-            if approval_callback:
-                approved, approved_for_session = approval_callback(
-                    tool_name, tool.description, tool.permission_level, parameters
-                )
 
-                if approved:
-                    if approved_for_session:
-                        self.session_approvals.add(tool_name)
+            return f"{response}\n\n(Tool execution was denied by user)"
 
-                    success, result = self.execute_tool(tool_name, parameters)
-                    if success:
-                        follow_up_prompt = (
-                            f"The tool {tool_name} was executed successfully. "
-                            f"Result: {result}\n\nPlease provide a helpful response to the user."
-                        )
-                        follow_up_response = self.client.generate(
-                            model, follow_up_prompt
-                        )
-                        return follow_up_response
-                    else:
-                        return result
-                else:
-                    return f"{response}\n\n(Tool execution was denied by user)"
-            else:
-                return f"{response}\n\n(Tool execution requires approval: {tool_name})"
-
-        return response
+        return f"{response}\n\n(Tool execution requires approval: {tool_name})"
