@@ -77,6 +77,7 @@ class AgentLoop:
             return str(Path.home() / "Downloads")
         if "picture" in lower or "images" in lower:
             return str(Path.home() / "Pictures")
+        # Handle both English and Spanish for Desktop
         if "desktop" in lower or "escritorio" in lower:
             return str(Path.home() / "Desktop")
         return str(Path.home() / "Desktop")
