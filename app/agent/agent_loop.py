@@ -1,4 +1,4 @@
-"""Agent loop for autonomous AI execution with tool support"""
+"""Agent loop for autonomous AI execution with tool support."""
 
 import json
 import logging
@@ -60,12 +60,26 @@ class AgentLoop:
             "Examples:\n"
             "[TOOL]create_folder {\"folder_path\": \"C:\\\\Users\\\\test\\\\Proyecto\"}\n"
             "[TOOL]read_file {\"file_path\": \"C:\\\\Users\\\\test\\\\notes.txt\"}\n"
+            "[TOOL]list_files {\"directory\": \"C:\\\\Users\\\\test\\\\Desktop\"}\n"
             "\n"
             "Never use markdown, never explain the tool call, and never add extra text around it.\n"
             "If the user request does not require a tool, answer normally.\n\n"
             f"User request: {user_prompt}\n\n"
             f"{self.get_tools_description()}"
         )
+
+    def _resolve_directory(self, text: str) -> str:
+        """Resolve standard desktop folders from a natural-language sentence."""
+        lower = text.lower()
+        if "document" in lower or "documents" in lower:
+            return str(Path.home() / "Documents")
+        if "download" in lower:
+            return str(Path.home() / "Downloads")
+        if "picture" in lower or "images" in lower:
+            return str(Path.home() / "Pictures")
+        if "desktop" in lower or "escritorio" in lower:
+            return str(Path.home() / "Desktop")
+        return str(Path.home() / "Desktop")
 
     def _extract_folder_name(self, prompt: str) -> str:
         """Extract a folder name from a natural-language prompt."""
@@ -80,30 +94,54 @@ class AgentLoop:
                 return match.group(1).strip()
         return "Proyecto"
 
-    def _infer_desktop_folder(self, folder_name: str) -> str:
-        """Resolve a folder path in the Desktop folder."""
-        return str(Path.home() / "Desktop" / folder_name)
+    def _extract_file_path(self, prompt: str) -> str:
+        """Extract a file path from a natural-language prompt if mentioned."""
+        patterns = [
+            r"['\"]([^'\"]+\.[A-Za-z0-9]+)['\"]",
+            r"([A-Za-z]:\\[^\s]+|~?/[^\s]+\.[A-Za-z0-9]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, prompt)
+            if match:
+                value = match.group(1) if match.group(1) else match.group(2)
+                if value:
+                    return value
+        return str(Path.home() / "Desktop" / "nota.txt")
 
     def infer_tool_request(self, prompt: str) -> Optional[tuple[str, dict]]:
         """Infer a tool call when the user gives a natural-language action."""
         p = prompt.lower()
 
-        if any(k in p for k in ["crear carpeta", "create folder", "create a folder", "carpeta llamada", "folder called", "folder named"]):
+        if any(k in p for k in [
+            "crear carpeta", "create folder", "create a folder",
+            "carpeta llamada", "folder called", "folder named",
+            "crear una carpeta", "make a folder"
+        ]):
             folder_name = self._extract_folder_name(prompt)
-            return "create_folder", {"folder_path": self._infer_desktop_folder(folder_name)}
+            return "create_folder", {"folder_path": str(Path(self._resolve_directory(prompt)) / folder_name)}
 
-        if any(k in p for k in ["listar archivos", "list files", "lista de archivos", "ver archivos", "show files"]):
-            directory = str(Path.home() / "Desktop")
-            return "list_files", {"directory": directory}
+        if any(k in p for k in [
+            "listar archivos", "list files", "lista de archivos",
+            "ver archivos", "show files", "muestra los archivos"
+        ]):
+            return "list_files", {"directory": self._resolve_directory(prompt)}
 
-        if any(k in p for k in ["leer archivo", "read file", "abre el archivo", "open file"]):
-            match = re.search(r"['\"]([^'\"]+\.[A-Za-z0-9]+)['\"]|([A-Za-z]:\\[^\s]+|~?/[^\s]+\.[A-Za-z0-9]+)", prompt)
-            file_path = match.group(1) if match and match.group(1) else (match.group(2) if match and match.group(2) else str(Path.home() / "Desktop" / "nota.txt"))
-            return "read_file", {"file_path": file_path}
+        if any(k in p for k in [
+            "leer archivo", "read file", "abre el archivo", "open file",
+            "muestra el contenido"
+        ]):
+            return "read_file", {"file_path": self._extract_file_path(prompt)}
 
-        if any(k in p for k in ["escribir archivo", "write file", "guardar archivo", "save file"]):
-            file_path = str(Path.home() / "Desktop" / "nuevo_archivo.txt")
-            return "write_file", {"file_path": file_path, "content": ""}
+        if any(k in p for k in [
+            "escribir archivo", "write file", "guardar archivo",
+            "save file", "crear archivo"
+        ]):
+            base_dir = self._resolve_directory(prompt)
+            file_name = "nuevo_archivo.txt"
+            match = re.search(r"([A-Za-z0-9_ .-]+\.[A-Za-z0-9]+)", prompt)
+            if match:
+                file_name = match.group(1)
+            return "write_file", {"file_path": str(Path(base_dir) / file_name), "content": ""}
 
         return None
 
