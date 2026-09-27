@@ -1,5 +1,6 @@
 """Configuration for Bionic AI Desktop"""
 
+import ctypes
 import os
 from pathlib import Path
 
@@ -32,9 +33,29 @@ PERMISSION_LEVELS = {
     "high": "Alto riesgo - Confirmación reforzada",
 }
 
-# Allowed paths for file operations
+
+def get_desktop_path() -> Path:
+    """Return the user's actual Windows Desktop path, including localized names."""
+    if os.name == "nt":
+        try:
+            buffer = ctypes.create_unicode_buffer(260)
+            # CSIDL_DESKTOPDIRECTORY returns the real Desktop folder, e.g. Escritorio.
+            result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buffer)
+            if result == 0 and buffer.value:
+                return Path(buffer.value)
+        except (AttributeError, OSError):
+            pass
+
+    candidates = [Path.home() / "Desktop", Path.home() / "Escritorio"]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+# Allowed paths for file operations. Resolve the localized Desktop once and reuse it.
 ALLOWED_PATHS = [
-    Path.home() / "Desktop",
+    get_desktop_path(),
     Path.home() / "Documents",
     Path.home() / "Downloads",
     Path.home() / "Pictures",
