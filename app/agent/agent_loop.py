@@ -8,6 +8,7 @@ from typing import Optional
 
 from app.agent.permission_manager import PermissionLevel, PermissionManager
 from app.agent.tool_registry import ToolRegistry
+from app.config import get_desktop_path
 from app.ollama_client import OllamaClient
 from app.storage.database import Database
 
@@ -42,26 +43,24 @@ class AgentLoop:
         description += (
             "\nCRITICAL INSTRUCTIONS:\n"
             "1. If the user asks for a file or system action, decide if a tool is needed.\n"
-            "2. If a tool is needed, return EXACTLY one tool call in this format:\n"
-            "   [TOOL]create_folder {\"folder_path\": \"C:\\\\Users\\\\test\\\\MyFolder\"}\n"
-            "3. Do not add markdown, explanations, or extra words before or after the tool call.\n"
-            "4. If no tool is needed, reply normally in natural language.\n"
-            "5. Only use one tool at a time."
+            "2. If a tool is needed, return EXACTLY one tool call in this format.\n"
+            "3. Never copy example paths such as C:\\\\Users\\\\test. Use the user's real path.\n"
+            "4. Do not add markdown, explanations, or extra words around the tool call.\n"
+            "5. If no tool is needed, reply normally in natural language.\n"
+            "6. Only use one tool at a time."
         )
         return description
 
     def build_system_prompt(self, user_prompt: str) -> str:
-        """Build a stronger system prompt for tool-driven actions."""
+        """Build a system prompt for tool-driven actions."""
+        desktop = str(get_desktop_path())
         return (
             "You are Bionic AI Desktop, a desktop assistant that uses tools when needed.\n\n"
             "Use tools only when the user asks for a filesystem, system, or command action.\n"
+            "Never use placeholder paths such as C:\\\\Users\\\\test.\n"
+            f"The user's real Desktop path is: {desktop}\n"
             "When a tool is needed, respond with exactly this format and nothing else:\n"
             "[TOOL]tool_name {\"param_name\": \"value\"}\n\n"
-            "Examples:\n"
-            "[TOOL]create_folder {\"folder_path\": \"C:\\\\Users\\\\test\\\\Proyecto\"}\n"
-            "[TOOL]read_file {\"file_path\": \"C:\\\\Users\\\\test\\\\notes.txt\"}\n"
-            "[TOOL]list_files {\"directory\": \"C:\\\\Users\\\\test\\\\Desktop\"}\n"
-            "\n"
             "Never use markdown, never explain the tool call, and never add extra text around it.\n"
             "If the user request does not require a tool, answer normally.\n\n"
             f"User request: {user_prompt}\n\n"
@@ -69,30 +68,34 @@ class AgentLoop:
         )
 
     def _resolve_directory(self, text: str) -> str:
-        """Resolve standard desktop folders from a natural-language sentence."""
+        """Resolve a standard user directory, including localized Windows Desktop."""
         lower = text.lower()
-        if "document" in lower or "documents" in lower:
+        if "document" in lower:
             return str(Path.home() / "Documents")
         if "download" in lower:
             return str(Path.home() / "Downloads")
-        if "picture" in lower or "images" in lower:
+        if "picture" in lower or "image" in lower or "imagen" in lower:
             return str(Path.home() / "Pictures")
-        # Handle both English and Spanish for Desktop
-        if "desktop" in lower or "escritorio" in lower:
-            return str(Path.home() / "Desktop")
-        return str(Path.home() / "Desktop")
+        return str(get_desktop_path())
 
     def _extract_folder_name(self, prompt: str) -> str:
-        """Extract a folder name from a natural-language prompt."""
-        patterns = [
-            r"(?:carpeta|folder|directorio)\s+(?:llamada|called|named)?\s*['\"]?([A-Za-z0-9_ .-]+)['\"]?",
-            r"(?:crear|create)\s+(?:la\s+)?(?:carpeta|folder)\s+(?:llamada|called|named)?\s*['\"]?([A-Za-z0-9_ .-]+)['\"]?",
-            r"(?:llamada|called|named)\s*['\"]?([A-Za-z0-9_ .-]+)['\"]?",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, prompt, flags=re.IGNORECASE)
-            if match:
-                return match.group(1).strip()
+        """Extract only the requested folder name, not trailing location words."""
+        quoted = re.search(
+            r"(?:carpeta|folder|directorio)\s+(?:llamada|llamado|called|named)?\s*['\"]([^'\"]+)['\"]",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+        if quoted:
+            return quoted.group(1).strip()
+
+        named = re.search(
+            r"(?:carpeta|folder|directorio)\s+(?:llamada|llamado|called|named)\s+([A-Za-z0-9_.-]+)",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+        if named:
+            return named.group(1).strip()
+
         return "Proyecto"
 
     def _extract_file_path(self, prompt: str) -> str:
@@ -104,90 +107,78 @@ class AgentLoop:
         for pattern in patterns:
             match = re.search(pattern, prompt)
             if match:
-                value = match.group(1) if match.group(1) else match.group(2)
-                if value:
-                    return value
-        return str(Path.home() / "Desktop" / "nota.txt")
+                return match.group(1)
+        return str(get_desktop_path() / "nota.txt")
 
     def infer_tool_request(self, prompt: str) -> Optional[tuple[str, dict]]:
-        """Infer a tool call when the user gives a natural-language action."""
+        """Infer a tool call from a natural-language user request."""
         p = prompt.lower()
 
-        if any(k in p for k in [
-            "crear carpeta", "create folder", "create a folder",
-            "carpeta llamada", "folder called", "folder named",
-            "crear una carpeta", "make a folder"
-        ]):
+        if any(k in p for k in (
+            "crear carpeta", "crear una carpeta", "create folder",
+            "create a folder", "carpeta llamada", "folder called",
+            "folder named", "make a folder",
+        )):
             folder_name = self._extract_folder_name(prompt)
-            return "create_folder", {"folder_path": str(Path(self._resolve_directory(prompt)) / folder_name)}
+            return "create_folder", {
+                "folder_path": str(Path(self._resolve_directory(prompt)) / folder_name)
+            }
 
-        if any(k in p for k in [
-            "listar archivos", "list files", "lista de archivos",
-            "ver archivos", "show files", "muestra los archivos"
-        ]):
+        if any(k in p for k in (
+            "listar archivos", "lista de archivos", "list files",
+            "ver archivos", "show files", "muestra los archivos",
+        )):
             return "list_files", {"directory": self._resolve_directory(prompt)}
 
-        if any(k in p for k in [
+        if any(k in p for k in (
             "leer archivo", "read file", "abre el archivo", "open file",
-            "muestra el contenido"
-        ]):
+            "muestra el contenido",
+        )):
             return "read_file", {"file_path": self._extract_file_path(prompt)}
 
-        if any(k in p for k in [
+        if any(k in p for k in (
             "escribir archivo", "write file", "guardar archivo",
-            "save file", "crear archivo"
-        ]):
+            "save file", "crear archivo",
+        )):
             base_dir = self._resolve_directory(prompt)
-            file_name = "nuevo_archivo.txt"
-            match = re.search(r"([A-Za-z0-9_ .-]+\.[A-Za-z0-9]+)", prompt)
-            if match:
-                file_name = match.group(1)
-            return "write_file", {"file_path": str(Path(base_dir) / file_name), "content": ""}
+            match = re.search(r"([A-Za-z0-9_.-]+\.[A-Za-z0-9]+)", prompt)
+            file_name = match.group(1) if match else "nuevo_archivo.txt"
+            return "write_file", {
+                "file_path": str(Path(base_dir) / file_name),
+                "content": "",
+            }
 
         return None
 
     def parse_tool_request(self, response: str) -> Optional[tuple[str, dict]]:
-        """Parse a tool request from an AI response."""
-        text = response.strip()
-
-        pattern = r"\[TOOL\]\s*([a-zA-Z_]+)\s*(\{.*?\})\s*$"
-        match = re.search(pattern, text, re.DOTALL)
-
+        """Parse a [TOOL] request from an AI response."""
+        match = re.search(
+            r"\[TOOL\]\s*([a-zA-Z_]+)\s*(\{.*?\})",
+            response.strip(),
+            re.DOTALL,
+        )
         if not match:
-            fallback = re.search(r"\[TOOL\]\s*([a-zA-Z_]+)\s*(\{.*?\})", text, re.DOTALL)
-            if not fallback:
-                return None
-            match = fallback
+            return None
 
-        tool_name = match.group(1)
         try:
             params = json.loads(match.group(2))
-            if not isinstance(params, dict):
-                return None
-            return tool_name, params
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse tool parameters: {e}")
+            return match.group(1), params if isinstance(params, dict) else None
+        except json.JSONDecodeError as exc:
+            logger.error("Failed to parse tool parameters: %s", exc)
             return None
 
     def process_response(self, response: str) -> Optional[tuple[str, dict]]:
-        """Check if response contains a tool request."""
-        tool_request = self.parse_tool_request(response)
-        if tool_request:
-            return tool_request
-        return self.infer_tool_request(response)
+        """Parse a model tool request, with natural-language fallback."""
+        return self.parse_tool_request(response) or self.infer_tool_request(response)
 
     def should_request_approval(
         self, tool_name: str, permission_level: PermissionLevel
     ) -> bool:
-        """Check if tool needs approval for this request."""
-        if tool_name in self.session_approvals:
-            return False
-        if permission_level == PermissionLevel.HIGH:
-            return True
-        return True
+        """Check if a tool needs approval for this request."""
+        return tool_name not in self.session_approvals
 
     def execute_tool(self, tool_name: str, parameters: dict) -> tuple[bool, str]:
-        """Execute a tool with safety checks."""
+        """Execute a tool and record the result."""
         tool = self.registry.get_tool(tool_name)
         if not tool:
             return False, f"Tool not found: {tool_name}"
@@ -202,8 +193,8 @@ class AgentLoop:
                 result=str(result)[:500],
             )
             return True, str(result)
-        except Exception as e:
-            error_msg = str(e)
+        except Exception as exc:
+            error_msg = str(exc)
             self.db.log_action(
                 action="tool_failed",
                 tool_name=tool_name,
@@ -211,22 +202,25 @@ class AgentLoop:
                 approved=True,
                 result=f"Error: {error_msg}",
             )
-            logger.error(f"Tool execution failed: {e}")
+            logger.exception("Tool execution failed")
             return False, f"Error executing {tool_name}: {error_msg}"
 
     def generate_with_tools(
         self, model: str, prompt: str, approval_callback=None
     ) -> str:
-        """Generate response with tool support."""
-        system_prompt = self.build_system_prompt(prompt)
+        """Generate a response and execute at most one approved tool."""
+        # Natural-language requests are authoritative. This prevents the model
+        # from copying the C:\\Users\\test example from the system prompt.
+        tool_request = self.infer_tool_request(prompt)
 
         try:
-            response = self.client.generate(model, system_prompt)
-        except Exception as e:
-            logger.error(f"Generation failed: {e}")
-            return f"Error: {str(e)}"
+            response = self.client.generate(model, self.build_system_prompt(prompt))
+        except Exception as exc:
+            logger.error("Generation failed: %s", exc)
+            return f"Error: {exc}"
 
-        tool_request = self.process_response(response)
+        if not tool_request:
+            tool_request = self.parse_tool_request(response)
         if not tool_request:
             return response
 
@@ -235,34 +229,27 @@ class AgentLoop:
         if not tool:
             return f"{response}\n\n(Tool {tool_name} not found)"
 
-        if not self.should_request_approval(tool_name, tool.permission_level):
-            success, result = self.execute_tool(tool_name, parameters)
-            if success:
-                follow_up_prompt = (
-                    f"The tool {tool_name} was executed successfully. "
-                    f"Result: {result}\n\nPlease provide a helpful response to the user."
-                )
-                return self.client.generate(model, follow_up_prompt)
-            return result
-
-        if approval_callback:
+        if self.should_request_approval(tool_name, tool.permission_level):
+            if not approval_callback:
+                return f"{response}\n\n(Tool execution requires approval: {tool_name})"
             approved, approved_for_session = approval_callback(
                 tool_name, tool.description, tool.permission_level, parameters
             )
+            if not approved:
+                return f"{response}\n\n(Tool execution was denied by user)"
+            if approved_for_session:
+                self.session_approvals.add(tool_name)
 
-            if approved:
-                if approved_for_session:
-                    self.session_approvals.add(tool_name)
+        success, result = self.execute_tool(tool_name, parameters)
+        if not success:
+            return result
 
-                success, result = self.execute_tool(tool_name, parameters)
-                if success:
-                    follow_up_prompt = (
-                        f"The tool {tool_name} was executed successfully. "
-                        f"Result: {result}\n\nPlease provide a helpful response to the user."
-                    )
-                    return self.client.generate(model, follow_up_prompt)
-                return result
-
-            return f"{response}\n\n(Tool execution was denied by user)"
-
-        return f"{response}\n\n(Tool execution requires approval: {tool_name})"
+        follow_up_prompt = (
+            f"The tool {tool_name} was executed successfully. Result: {result}\n\n"
+            "Reply briefly and naturally in the user's language. Confirm the real path."
+        )
+        try:
+            return self.client.generate(model, follow_up_prompt)
+        except Exception as exc:
+            logger.error("Follow-up generation failed: %s", exc)
+            return f"Acción completada: {result}"
