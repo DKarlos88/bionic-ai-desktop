@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Optional
 
 from app.agent.permission_manager import PermissionLevel, PermissionManager
@@ -66,16 +67,54 @@ class AgentLoop:
             f"{self.get_tools_description()}"
         )
 
+    def _extract_folder_name(self, prompt: str) -> str:
+        """Extract a folder name from a natural-language prompt."""
+        patterns = [
+            r"(?:carpeta|folder|directorio)\s+(?:llamada|called|named)?\s*['\"]?([A-Za-z0-9_ .-]+)['\"]?",
+            r"(?:crear|create)\s+(?:la\s+)?(?:carpeta|folder)\s+(?:llamada|called|named)?\s*['\"]?([A-Za-z0-9_ .-]+)['\"]?",
+            r"(?:llamada|called|named)\s*['\"]?([A-Za-z0-9_ .-]+)['\"]?",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, prompt, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return "Proyecto"
+
+    def _infer_desktop_folder(self, folder_name: str) -> str:
+        """Resolve a folder path in the Desktop folder."""
+        return str(Path.home() / "Desktop" / folder_name)
+
+    def infer_tool_request(self, prompt: str) -> Optional[tuple[str, dict]]:
+        """Infer a tool call when the user gives a natural-language action."""
+        p = prompt.lower()
+
+        if any(k in p for k in ["crear carpeta", "create folder", "create a folder", "carpeta llamada", "folder called", "folder named"]):
+            folder_name = self._extract_folder_name(prompt)
+            return "create_folder", {"folder_path": self._infer_desktop_folder(folder_name)}
+
+        if any(k in p for k in ["listar archivos", "list files", "lista de archivos", "ver archivos", "show files"]):
+            directory = str(Path.home() / "Desktop")
+            return "list_files", {"directory": directory}
+
+        if any(k in p for k in ["leer archivo", "read file", "abre el archivo", "open file"]):
+            match = re.search(r"['\"]([^'\"]+\.[A-Za-z0-9]+)['\"]|([A-Za-z]:\\[^\s]+|~?/[^\s]+\.[A-Za-z0-9]+)", prompt)
+            file_path = match.group(1) if match and match.group(1) else (match.group(2) if match and match.group(2) else str(Path.home() / "Desktop" / "nota.txt"))
+            return "read_file", {"file_path": file_path}
+
+        if any(k in p for k in ["escribir archivo", "write file", "guardar archivo", "save file"]):
+            file_path = str(Path.home() / "Desktop" / "nuevo_archivo.txt")
+            return "write_file", {"file_path": file_path, "content": ""}
+
+        return None
+
     def parse_tool_request(self, response: str) -> Optional[tuple[str, dict]]:
         """Parse a tool request from an AI response."""
         text = response.strip()
 
-        # Primary format: [TOOL]name {json}
         pattern = r"\[TOOL\]\s*([a-zA-Z_]+)\s*(\{.*?\})\s*$"
         match = re.search(pattern, text, re.DOTALL)
 
         if not match:
-            # Fallback: allow extra commentary before/after the tool call
             fallback = re.search(r"\[TOOL\]\s*([a-zA-Z_]+)\s*(\{.*?\})", text, re.DOTALL)
             if not fallback:
                 return None
@@ -93,7 +132,10 @@ class AgentLoop:
 
     def process_response(self, response: str) -> Optional[tuple[str, dict]]:
         """Check if response contains a tool request."""
-        return self.parse_tool_request(response)
+        tool_request = self.parse_tool_request(response)
+        if tool_request:
+            return tool_request
+        return self.infer_tool_request(response)
 
     def should_request_approval(
         self, tool_name: str, permission_level: PermissionLevel
