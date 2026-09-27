@@ -1,36 +1,45 @@
 """Main application window"""
 
-import sys
 import logging
-from PySide6.QtWidgets import (
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QPushButton,
-    QComboBox,
-    QLabel,
-    QMessageBox,
-    QTabWidget,
-)
-from PySide6.QtCore import QThread, QObject, Signal
+import sys
+from threading import Event
 
-from app.config import WINDOW_WIDTH, WINDOW_HEIGHT, APP_NAME
-from app.ollama_client import OllamaClient
-from app.storage.database import Database
-from app.agent.tools_loader import load_tools
+from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtWidgets import (
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
 from app.agent.agent_loop import AgentLoop
 from app.agent.permission_manager import PermissionLevel
-from app.ui.chat_widget import ChatWidget
-from app.ui.audit_widget import AuditWidget
+from app.config import APP_NAME, WINDOW_HEIGHT, WINDOW_WIDTH
+from app.agent.tools_loader import load_tools
+from app.ollama_client import OllamaClient
+from app.storage.database import Database
 from app.ui.approval_dialog import ApprovalDialog
+from app.ui.audit_widget import AuditWidget
+from app.ui.chat_widget import ChatWidget
 
 logger = logging.getLogger(__name__)
 
 
 class ApprovalRequest:
     """Container for approval request data"""
-    def __init__(self, tool_name: str, description: str, permission_level: PermissionLevel, parameters: dict):
+
+    def __init__(
+        self,
+        tool_name: str,
+        description: str,
+        permission_level: PermissionLevel,
+        parameters: dict,
+    ):
         self.tool_name = tool_name
         self.description = description
         self.permission_level = permission_level
@@ -50,7 +59,7 @@ class GenerateWorker(QObject):
         self.model = model
         self.prompt = prompt
         self._approval_result = (False, False)
-        self._approval_event = None
+        self._approval_event = Event()
 
     def run(self):
         try:
@@ -65,26 +74,22 @@ class GenerateWorker(QObject):
             self.error.emit(str(e))
 
     def request_approval(self, tool_name, description, permission_level, parameters):
-        """Request approval - emit signal to main thread"""
+        """Request approval - emit signal to main thread and block until response"""
         request = ApprovalRequest(tool_name, description, permission_level, parameters)
+        self._approval_event.clear()
         self.approval_requested.emit(request)
-        
-        # Wait a bit for main thread to process (simplified blocking)
-        import time
-        for _ in range(50):  # Wait up to 5 seconds
-            if self._approval_result != (False, False) or getattr(self, '_approval_set', False):
-                break
-            time.sleep(0.1)
-        
+
+        # Block until main thread sets the approval result
+        self._approval_event.wait()
+
         result = self._approval_result
         self._approval_result = (False, False)
-        self._approval_set = False
         return result
 
     def set_approval_result(self, approved: bool, approved_for_session: bool):
         """Set the approval result from main thread"""
         self._approval_result = (approved, approved_for_session)
-        self._approval_set = True
+        self._approval_event.set()
 
 
 class MainWindow(QMainWindow):
@@ -193,7 +198,7 @@ class MainWindow(QMainWindow):
         self.current_worker.finished.connect(self.current_worker.deleteLater)
         self.current_worker.error.connect(self.current_worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        
+
         thread.start()
 
     def on_approval_requested(self, request: ApprovalRequest):
@@ -204,10 +209,10 @@ class MainWindow(QMainWindow):
             request.permission_level,
             request.parameters,
         )
-        result = dialog.exec_()
-        approved = result == 1
+        result = dialog.exec()
+        approved = result == 1  # QDialog.Accepted
         approved_for_session = dialog.approved_for_session if approved else False
-        
+
         if self.current_worker:
             self.current_worker.set_approval_result(approved, approved_for_session)
 
