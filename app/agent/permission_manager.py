@@ -20,20 +20,37 @@ class PermissionManager:
     """Manages permissions for tool execution"""
 
     def __init__(self):
-        self.allowed_paths = [Path(p) for p in ALLOWED_PATHS]
+        # Normalize allowed paths once at initialization
+        self.allowed_paths = [Path(p).resolve() for p in ALLOWED_PATHS]
         self.denied_commands = DENIED_COMMANDS
+        logger.info(f"Allowed paths: {self.allowed_paths}")
 
     def check_file_access(self, file_path: str | Path) -> bool:
         """Check if file path is allowed"""
-        file_path = Path(file_path).resolve()
-        for allowed in self.allowed_paths:
-            try:
-                file_path.relative_to(allowed.resolve())
-                return True
-            except ValueError:
-                continue
-        logger.warning(f"Access denied to: {file_path}")
-        return False
+        try:
+            # Normalize the file path
+            file_path = Path(file_path).resolve()
+            
+            # Debug logging
+            logger.debug(f"Checking access for: {file_path}")
+            
+            # Check if the file is under any allowed directory
+            for allowed in self.allowed_paths:
+                try:
+                    # This will succeed if file_path is under allowed
+                    file_path.relative_to(allowed)
+                    logger.debug(f"Access granted (under {allowed}): {file_path}")
+                    return True
+                except ValueError:
+                    # Not under this allowed path, continue to next
+                    continue
+            
+            # Not under any allowed path
+            logger.warning(f"Access denied to: {file_path}")
+            return False
+        except Exception as e:
+            logger.error(f"Error checking file access for {file_path}: {e}")
+            return False
 
     def check_command_safety(self, command: str) -> bool:
         """Check if command is safe to execute"""
