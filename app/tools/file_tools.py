@@ -9,9 +9,21 @@ logger = logging.getLogger(__name__)
 permission_manager = PermissionManager()
 
 
+def _normalize_path(file_path: str | Path) -> Path:
+    """Normalize a file path by removing extra spaces and resolving it."""
+    if isinstance(file_path, Path):
+        return file_path.resolve()
+    
+    # Convert to string, strip extra whitespace, then resolve
+    normalized = str(file_path).strip()
+    return Path(normalized).resolve()
+
+
 def read_file(file_path: str) -> str:
     """Read file contents"""
-    path = Path(file_path)
+    path = _normalize_path(file_path)
+    logger.debug(f"read_file normalized path: {path}")
+    
     if not permission_manager.check_file_access(path):
         return f"Error: Access denied to {file_path}"
 
@@ -25,7 +37,9 @@ def read_file(file_path: str) -> str:
 
 def write_file(file_path: str, content: str) -> str:
     """Write content to file"""
-    path = Path(file_path)
+    path = _normalize_path(file_path)
+    logger.debug(f"write_file normalized path: {path}")
+    
     if not permission_manager.check_file_access(path):
         return f"Error: Access denied to {file_path}"
 
@@ -41,7 +55,9 @@ def write_file(file_path: str, content: str) -> str:
 
 def list_files(directory: str) -> list[str]:
     """List files in directory"""
-    path = Path(directory)
+    path = _normalize_path(directory)
+    logger.debug(f"list_files normalized path: {path}")
+    
     if not permission_manager.check_file_access(path):
         return [f"Error: Access denied to {directory}"]
 
@@ -54,7 +70,9 @@ def list_files(directory: str) -> list[str]:
 
 def delete_file(file_path: str) -> str:
     """Delete a file"""
-    path = Path(file_path)
+    path = _normalize_path(file_path)
+    logger.debug(f"delete_file normalized path: {path}")
+    
     if not permission_manager.check_file_access(path):
         return f"Error: Access denied to {file_path}"
 
@@ -71,7 +89,9 @@ def delete_file(file_path: str) -> str:
 
 def create_folder(folder_path: str) -> str:
     """Create a folder"""
-    path = Path(folder_path)
+    path = _normalize_path(folder_path)
+    logger.debug(f"create_folder normalized path: {path}")
+    
     if not permission_manager.check_file_access(path):
         return f"Error: Access denied to {folder_path}"
 
@@ -85,8 +105,11 @@ def create_folder(folder_path: str) -> str:
 
 def copy_file(source: str, destination: str) -> str:
     """Copy file"""
-    src_path = Path(source)
-    dst_path = Path(destination)
+    src_path = _normalize_path(source)
+    dst_path = _normalize_path(destination)
+    
+    logger.debug(f"copy_file normalized source: {src_path}")
+    logger.debug(f"copy_file normalized destination: {dst_path}")
 
     if not permission_manager.check_file_access(src_path):
         return f"Error: Access denied to source {source}"
