@@ -1,8 +1,10 @@
 """File system tools"""
 
 import logging
-from pathlib import Path
+import re
 import shutil
+from pathlib import Path
+
 from app.agent.permission_manager import PermissionManager
 
 logger = logging.getLogger(__name__)
@@ -10,20 +12,33 @@ permission_manager = PermissionManager()
 
 
 def _normalize_path(file_path: str | Path) -> Path:
-    """Normalize a file path by removing extra spaces and resolving it."""
+    """Normalize a file path to avoid malformed paths like 'DKarlos \& Maria'."""
     if isinstance(file_path, Path):
-        return file_path.resolve()
-    
-    # Convert to string, strip extra whitespace, then resolve
-    normalized = str(file_path).strip()
-    return Path(normalized).resolve()
+        raw = str(file_path)
+    else:
+        raw = str(file_path or "").strip()
+
+    if not raw:
+        return Path.cwd()
+
+    # Fix malformed Windows paths that sometimes come out as:
+    #   C:\Users\DKarlos \& Maria\Desktop\file.txt
+    # and normalize them to:
+    #   C:\Users\DKarlos & Maria\Desktop\file.txt
+    raw = re.sub(r"\s*&\s*", " & ", raw)
+    raw = re.sub(r"\s{2,}", " ", raw)
+
+    path = Path(raw).expanduser()
+    try:
+        return path.resolve(strict=False)
+    except Exception:
+        return path
 
 
 def read_file(file_path: str) -> str:
     """Read file contents"""
     path = _normalize_path(file_path)
-    logger.debug(f"read_file normalized path: {path}")
-    
+    logger.debug("read_file normalized path: %s", path)
     if not permission_manager.check_file_access(path):
         return f"Error: Access denied to {file_path}"
 
@@ -38,8 +53,7 @@ def read_file(file_path: str) -> str:
 def write_file(file_path: str, content: str) -> str:
     """Write content to file"""
     path = _normalize_path(file_path)
-    logger.debug(f"write_file normalized path: {path}")
-    
+    logger.debug("write_file normalized path: %s", path)
     if not permission_manager.check_file_access(path):
         return f"Error: Access denied to {file_path}"
 
@@ -56,8 +70,7 @@ def write_file(file_path: str, content: str) -> str:
 def list_files(directory: str) -> list[str]:
     """List files in directory"""
     path = _normalize_path(directory)
-    logger.debug(f"list_files normalized path: {path}")
-    
+    logger.debug("list_files normalized path: %s", path)
     if not permission_manager.check_file_access(path):
         return [f"Error: Access denied to {directory}"]
 
@@ -71,8 +84,7 @@ def list_files(directory: str) -> list[str]:
 def delete_file(file_path: str) -> str:
     """Delete a file"""
     path = _normalize_path(file_path)
-    logger.debug(f"delete_file normalized path: {path}")
-    
+    logger.debug("delete_file normalized path: %s", path)
     if not permission_manager.check_file_access(path):
         return f"Error: Access denied to {file_path}"
 
@@ -80,8 +92,7 @@ def delete_file(file_path: str) -> str:
         if path.is_file():
             path.unlink()
             return f"File deleted: {file_path}"
-        else:
-            return f"Error: Not a file: {file_path}"
+        return f"Error: Not a file: {file_path}"
     except Exception as e:
         logger.error(f"Failed to delete file: {e}")
         return f"Error: {str(e)}"
@@ -90,8 +101,7 @@ def delete_file(file_path: str) -> str:
 def create_folder(folder_path: str) -> str:
     """Create a folder"""
     path = _normalize_path(folder_path)
-    logger.debug(f"create_folder normalized path: {path}")
-    
+    logger.debug("create_folder normalized path: %s", path)
     if not permission_manager.check_file_access(path):
         return f"Error: Access denied to {folder_path}"
 
@@ -107,9 +117,8 @@ def copy_file(source: str, destination: str) -> str:
     """Copy file"""
     src_path = _normalize_path(source)
     dst_path = _normalize_path(destination)
-    
-    logger.debug(f"copy_file normalized source: {src_path}")
-    logger.debug(f"copy_file normalized destination: {dst_path}")
+    logger.debug("copy_file normalized source: %s", src_path)
+    logger.debug("copy_file normalized destination: %s", dst_path)
 
     if not permission_manager.check_file_access(src_path):
         return f"Error: Access denied to source {source}"
