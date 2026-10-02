@@ -52,7 +52,9 @@ class AgentLoop:
             "3. Never copy example paths such as C:\\\\Users\\\\test. Use the user's real path.\n"
             "4. Do not add markdown, explanations, or extra words around the tool call.\n"
             "5. If no tool is needed, reply normally in natural language.\n"
-            "6. Only use one tool at a time."
+            "6. Only use one tool at a time.\n"
+            "7. Use only this format: [TOOL]tool_name {\"param_name\": \"value\"}\n"
+            "8. Do not add a second sentence, explanation text, or JSON outside the tool block.\n"
         )
         return description
 
@@ -64,9 +66,9 @@ class AgentLoop:
             "Use tools only when the user asks for a filesystem, system, or command action.\n"
             "Never use placeholder paths such as C:\\\\Users\\\\test.\n"
             f"The user's real Desktop path is: {desktop}\n"
-            "When a tool is needed, respond with exactly this format and nothing else:\n"
+            "When a tool is needed, respond with EXACTLY this format and nothing else:\n"
             "[TOOL]tool_name {\"param_name\": \"value\"}\n\n"
-            "Never use markdown, never explain the tool call, and never add extra text around it.\n"
+            "CRITICAL: Do not add markdown, do not explain, do not add extra text.\n"
             "If the user request does not require a tool, answer normally.\n\n"
             f"User request: {user_prompt}\n\n"
             f"{self.get_tools_description()}"
@@ -155,22 +157,89 @@ class AgentLoop:
 
         return None
 
+    def _parse_tool_arguments(self, tool_name: str, raw_args: str) -> Optional[dict]:
+        """Parse the arguments from a raw tool call string."""
+        if not raw_args:
+            return {}
+
+        raw_args = raw_args.strip()
+        if raw_args.startswith("{") and raw_args.endswith("}"):
+            try:
+                params = json.loads(raw_args)
+                return params if isinstance(params, dict) else {}
+            except json.JSONDecodeError:
+                logger.warning("JSON parse failed for %s: %s", tool_name, raw_args)
+                return None
+
+        # Handle function-call style: tool_name("a", "b")
+        values = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', raw_args)
+        if values:
+            if tool_name == "create_folder":
+                return {"folder_path": values[0]}
+            if tool_name == "list_files":
+                return {"directory": values[0]}
+            if tool_name == "read_file":
+                return {"file_path": values[0]}
+            if tool_name == "write_file":
+                return {"file_path": values[0], "content": values[1] if len(values) > 1 else ""}
+            if tool_name == "execute_command":
+                return {"command": values[0], "timeout": int(values[1]) if len(values) > 1 else 30}
+            if tool_name == "execute_powershell":
+                return {"command": values[0], "timeout": int(values[1]) if len(values) > 1 else 30}
+
+        # Handle compact key:value forms like: tool_name key="value"
+        kv_pairs = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\"([^\"]*)\"", raw_args)
+        if kv_pairs:
+            return {key: value for key, value in kv_pairs}
+
+        return None
+
     def parse_tool_request(self, response: str) -> Optional[tuple[str, dict]]:
-        """Parse a [TOOL] request from an AI response."""
-        match = re.search(
-            r"\[TOOL\]\s*([a-zA-Z_]+)\s*(\{.*?\})",
-            response.strip(),
-            re.DOTALL,
-        )
-        if not match:
+        """Parse a model tool call in multiple supported formats."""
+        if not response:
             return None
 
-        try:
-            params = json.loads(match.group(2))
-            return match.group(1), params if isinstance(params, dict) else None
-        except json.JSONDecodeError as exc:
-            logger.error("Failed to parse tool parameters: %s", exc)
-            return None
+        text = response.strip()
+        text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+        text = text.replace("\r", " ").replace("\n", " ")
+
+        # Case 1: [TOOL]tool_name {"param": "value"}
+        match = re.search(
+            r"(?:\[TOOL\]|\bTOOL\b\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*(\{.*\})",
+            text,
+            re.DOTALL,
+        )
+        if match:
+            tool_name = match.group(1)
+            params = self._parse_tool_arguments(tool_name, match.group(2))
+            if params is not None:
+                return tool_name, params
+
+        # Case 2: tool_name("arg", "arg2") or tool_name('arg')
+        match = re.search(
+            r"(?:\[TOOL\]|\bTOOL\b\s*)?([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)",
+            text,
+            re.DOTALL,
+        )
+        if match:
+            tool_name = match.group(1)
+            params = self._parse_tool_arguments(tool_name, match.group(2))
+            if params is not None:
+                return tool_name, params
+
+        # Case 3: tool_name {"param": "value"} without [TOOL]
+        match = re.search(
+            r"([A-Za-z_][A-Za-z0-9_]*)\s*(\{.*\})",
+            text,
+            re.DOTALL,
+        )
+        if match:
+            tool_name = match.group(1)
+            params = self._parse_tool_arguments(tool_name, match.group(2))
+            if params is not None:
+                return tool_name, params
+
+        return None
 
     def process_response(self, response: str) -> Optional[tuple[str, dict]]:
         """Parse a model tool request, with natural-language fallback."""
@@ -191,7 +260,6 @@ class AgentLoop:
         if not tool:
             return False, f"Tool not found: {tool_name}"
 
-        # security checks here if needed
         try:
             result = tool.func(**parameters)
             self.db.log_action(
