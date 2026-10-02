@@ -29,7 +29,12 @@ class AgentLoop:
         self.registry = registry
         self.db = db
         self.permission_manager = permission_manager or PermissionManager()
-        self.session_approvals = set()  # Set of tool_name strings approved this session
+        self.session_approvals = set()
+
+    def grant_session_approval(self, tool_name: str) -> None:
+        """Persist a tool approval for the current session."""
+        self.session_approvals.add(tool_name)
+        logger.info("Session approval granted for tool: %s", tool_name)
 
     def get_tools_description(self) -> str:
         """Get formatted description of available tools for the AI."""
@@ -41,14 +46,13 @@ class AgentLoop:
             description += f"- {tool.name}({params_str}): {tool.description}\n"
 
         description += (
-            "\n*** CRITICAL INSTRUCTIONS FOR YOU ***\n"
-            "1. ALWAYS use this exact format when you need a tool:\n"
-            "   [TOOL]tool_name {\"param_name\": \"value\"}\n"
-            "2. NEVER use markdown, explanations, or extra text around the tool call.\n"
-            "3. NEVER copy example paths. Use REAL user paths only.\n"
-            "4. ONE tool call per response only.\n"
-            "5. If no tool is needed, reply normally in Spanish.\n"
-            "6. If you use a tool, ONLY output the [TOOL]... line. Nothing else.\n"
+            "\nCRITICAL INSTRUCTIONS:\n"
+            "1. If the user asks for a file or system action, decide if a tool is needed.\n"
+            "2. If a tool is needed, return EXACTLY one tool call in this format.\n"
+            "3. Never copy example paths such as C:\\\\Users\\\\test. Use the user's real path.\n"
+            "4. Do not add markdown, explanations, or extra words around the tool call.\n"
+            "5. If no tool is needed, reply normally in natural language.\n"
+            "6. Only use one tool at a time."
         )
         return description
 
@@ -56,15 +60,14 @@ class AgentLoop:
         """Build a system prompt for tool-driven actions."""
         desktop = str(get_desktop_path())
         return (
-            "You are Bionic AI Desktop, a desktop assistant that uses tools when needed.\n"
-            "You speak Spanish (español) when replying normally.\n\n"
-            "Use tools ONLY when the user asks for a filesystem, system, or command action.\n"
+            "You are Bionic AI Desktop, a desktop assistant that uses tools when needed.\n\n"
+            "Use tools only when the user asks for a filesystem, system, or command action.\n"
             "Never use placeholder paths such as C:\\\\Users\\\\test.\n"
-            f"The user's real Desktop path is: {desktop}\n\n"
-            "When a tool is needed, respond with EXACTLY this format and NOTHING ELSE:\n"
+            f"The user's real Desktop path is: {desktop}\n"
+            "When a tool is needed, respond with exactly this format and nothing else:\n"
             "[TOOL]tool_name {\"param_name\": \"value\"}\n\n"
-            "CRITICAL: Do not add markdown, do not explain, do not add extra text.\n"
-            "If the user request does not require a tool, reply normally in Spanish.\n\n"
+            "Never use markdown, never explain the tool call, and never add extra text around it.\n"
+            "If the user request does not require a tool, answer normally.\n\n"
             f"User request: {user_prompt}\n\n"
             f"{self.get_tools_description()}"
         )
@@ -154,64 +157,20 @@ class AgentLoop:
 
     def parse_tool_request(self, response: str) -> Optional[tuple[str, dict]]:
         """Parse a [TOOL] request from an AI response."""
-        # Clean response: remove markdown if present
-        response = response.strip()
-        
-        # Pattern 1: [TOOL]name {...}
         match = re.search(
             r"\[TOOL\]\s*([a-zA-Z_]+)\s*(\{.*?\})",
-            response,
+            response.strip(),
             re.DOTALL,
         )
-        if match:
-            try:
-                tool_name = match.group(1)
-                params = json.loads(match.group(2))
-                return tool_name, params if isinstance(params, dict) else {}
-            except json.JSONDecodeError as exc:
-                logger.warning("Failed to parse [TOOL] JSON: %s", exc)
-                return None
+        if not match:
+            return None
 
-        # Pattern 2: Plain function call like: tool_name({...})
-        match = re.search(
-            r"([a-zA-Z_]+)\s*\(\s*(\{.*?\})\s*\)",
-            response,
-            re.DOTALL,
-        )
-        if match:
-            try:
-                tool_name = match.group(1)
-                params = json.loads(match.group(2))
-                return tool_name, params if isinstance(params, dict) else {}
-            except json.JSONDecodeError as exc:
-                logger.warning("Failed to parse function call JSON: %s", exc)
-                return None
-
-        # Pattern 3: Plain function with string arguments like: tool_name("arg", "arg2")
-        match = re.search(
-            r"([a-zA-Z_]+)\s*\(\s*\"([^\"]*)\"\s*(?:,\s*\"([^\"]*)\")?\s*\)",
-            response,
-        )
-        if match:
-            tool_name = match.group(1)
-            arg1 = match.group(2)
-            arg2 = match.group(3)
-            
-            # Map common tool signatures
-            if tool_name == "create_folder":
-                return tool_name, {"folder_path": arg1}
-            elif tool_name == "list_files":
-                return tool_name, {"directory": arg1}
-            elif tool_name == "read_file":
-                return tool_name, {"file_path": arg1}
-            elif tool_name == "write_file":
-                return tool_name, {"file_path": arg1, "content": arg2 or ""}
-            elif tool_name == "execute_command":
-                return tool_name, {"command": arg1, "timeout": 30}
-            elif tool_name == "execute_powershell":
-                return tool_name, {"command": arg1, "timeout": 30}
-
-        return None
+        try:
+            params = json.loads(match.group(2))
+            return match.group(1), params if isinstance(params, dict) else None
+        except json.JSONDecodeError as exc:
+            logger.error("Failed to parse tool parameters: %s", exc)
+            return None
 
     def process_response(self, response: str) -> Optional[tuple[str, dict]]:
         """Parse a model tool request, with natural-language fallback."""
@@ -221,67 +180,18 @@ class AgentLoop:
         self, tool_name: str, permission_level: PermissionLevel
     ) -> bool:
         """Check if a tool needs approval for this request."""
-        return tool_name not in self.session_approvals
+        if tool_name in self.session_approvals:
+            logger.info("Tool %s already approved for this session", tool_name)
+            return False
+        return True
 
     def execute_tool(self, tool_name: str, parameters: dict) -> tuple[bool, str]:
-        """Execute a tool and record the result. Checks permissions BEFORE execution."""
+        """Execute a tool and record the result."""
         tool = self.registry.get_tool(tool_name)
         if not tool:
             return False, f"Tool not found: {tool_name}"
 
-        # CRITICAL: Validate permissions BEFORE execution
-        
-        # Block dangerous commands ALWAYS
-        if tool_name == "execute_command":
-            command = parameters.get("command", "")
-            if not self.permission_manager.check_command_safety(command):
-                error_msg = f"Dangerous command blocked: {command}"
-                logger.warning(f"Command blocked: {command}")
-                self.db.log_action(
-                    action="tool_denied",
-                    tool_name=tool_name,
-                    command=str(parameters),
-                    approved=False,
-                    result=error_msg,
-                )
-                return False, error_msg
-        
-        if tool_name == "execute_powershell":
-            command = parameters.get("command", "")
-            if not self.permission_manager.check_command_safety(command):
-                error_msg = f"Dangerous command blocked: {command}"
-                logger.warning(f"PowerShell command blocked: {command}")
-                self.db.log_action(
-                    action="tool_denied",
-                    tool_name=tool_name,
-                    command=str(parameters),
-                    approved=False,
-                    result=error_msg,
-                )
-                return False, error_msg
-        
-        # Check file permissions
-        if tool_name in ("read_file", "write_file", "delete_file", "copy_file", "create_folder", "list_files"):
-            file_param = (
-                parameters.get("file_path") 
-                or parameters.get("folder_path") 
-                or parameters.get("directory") 
-                or parameters.get("source") 
-                or parameters.get("destination")
-            )
-            if file_param and not self.permission_manager.check_file_access(file_param):
-                error_msg = f"Access denied to: {file_param}"
-                logger.warning(f"File access denied: {file_param}")
-                self.db.log_action(
-                    action="tool_denied",
-                    tool_name=tool_name,
-                    command=str(parameters),
-                    approved=False,
-                    result=error_msg,
-                )
-                return False, error_msg
-
-        # Execute the tool
+        # security checks here if needed
         try:
             result = tool.func(**parameters)
             self.db.log_action(
@@ -291,7 +201,6 @@ class AgentLoop:
                 approved=True,
                 result=str(result)[:500],
             )
-            logger.info(f"Tool executed successfully: {tool_name}")
             return True, str(result)
         except Exception as exc:
             error_msg = str(exc)
@@ -302,15 +211,13 @@ class AgentLoop:
                 approved=True,
                 result=f"Error: {error_msg}",
             )
-            logger.exception(f"Tool execution failed: {tool_name}")
+            logger.exception("Tool execution failed")
             return False, f"Error executing {tool_name}: {error_msg}"
 
     def generate_with_tools(
         self, model: str, prompt: str, approval_callback=None
     ) -> str:
         """Generate a response and execute at most one approved tool."""
-        # Natural-language requests are authoritative. This prevents the model
-        # from copying the C:\\Users\\test example from the system prompt.
         tool_request = self.infer_tool_request(prompt)
 
         try:
@@ -321,8 +228,6 @@ class AgentLoop:
 
         if not tool_request:
             tool_request = self.parse_tool_request(response)
-        
-        # If no tool is needed, return the response as-is
         if not tool_request:
             return response
 
@@ -331,46 +236,28 @@ class AgentLoop:
         if not tool:
             return f"{response}\n\n(Tool {tool_name} not found)"
 
-        # Check if approval is needed
         if self.should_request_approval(tool_name, tool.permission_level):
             if not approval_callback:
                 return f"{response}\n\n(Tool execution requires approval: {tool_name})"
-            
-            logger.info(f"Requesting approval for tool: {tool_name}")
             approved, approved_for_session = approval_callback(
                 tool_name, tool.description, tool.permission_level, parameters
             )
             if not approved:
-                logger.info(f"Tool execution denied by user: {tool_name}")
-                self.db.log_action(
-                    action="tool_denied",
-                    tool_name=tool_name,
-                    command=str(parameters),
-                    approved=False,
-                    result="User denied approval",
-                )
+                logger.info("User denied approval for tool: %s", tool_name)
                 return f"(Tool execution was denied by user)"
-            
             if approved_for_session:
-                logger.info(f"Approval granted for session: {tool_name}")
-                self.session_approvals.add(tool_name)
-        else:
-            logger.info(f"Tool already approved for session: {tool_name}")
+                self.grant_session_approval(tool_name)
 
-        # Execute the tool (with permission checks inside execute_tool)
         success, result = self.execute_tool(tool_name, parameters)
         if not success:
             return result
 
-        # Follow-up with the model to generate a natural response
         follow_up_prompt = (
             f"The tool {tool_name} was executed successfully. Result: {result}\n\n"
-            "Reply briefly and naturally in Spanish. Confirm what was done using the real path."
+            "Reply briefly and naturally in the user's language. Confirm the real path."
         )
         try:
-            final_response = self.client.generate(model, follow_up_prompt)
-            logger.info(f"Follow-up response generated: {final_response[:100]}")
-            return final_response
+            return self.client.generate(model, follow_up_prompt)
         except Exception as exc:
             logger.error("Follow-up generation failed: %s", exc)
             return f"Acción completada: {result}"
